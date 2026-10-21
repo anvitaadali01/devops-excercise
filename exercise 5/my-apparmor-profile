@@ -1,0 +1,53 @@
+#include <tunables/global>
+
+profile flask-apparmor flags=(attach_disconnected,mediate_deleted) {
+  / x,
+  # Python 3.11 official images use this interpreter and library layout.
+  /usr/local/bin/python3.11 rix,
+  /usr/local/ x,
+  /usr/local/bin/ x,
+  /usr/local/lib/ x,
+  /usr/local/lib/**/ x,
+  /usr/local/lib/python3.11/** r,
+  /usr/local/lib/python3.11/**.so* mr,
+  /usr/local/lib/**.so* mr,
+  /usr/lib/ x,
+  /usr/lib/**/ x,
+  /usr/lib/** mr,
+  /lib/ x,
+  /lib/**/ x,
+  /lib/** mr,
+  /lib64/ x,
+  /lib64/ld-linux* mr,
+  /etc/ x,
+  /etc/ld.so.cache r,
+  /etc/ssl/ x,
+  /etc/ssl/certs/ x,
+  /etc/ssl/certs/**/ x,
+  /etc/ssl/certs/** r,
+  /bin/ x,
+  /usr/bin/ x,
+  /usr/bin/bash r,
+
+  # Application source is readable but not writable by the confined process.
+  /app/ rix,
+  /app/** r,
+
+  # Permit the TCP sockets needed to serve HTTP; other network classes have
+  # no allow rule and remain denied by this enforce-mode profile.
+  network inet stream,
+  network inet6 stream,
+
+  # Keep account, privilege-escalation, SSH, and variable data inaccessible.
+  deny /etc/passwd r,
+  deny /etc/group r,
+  deny /etc/shadow r,
+  deny /etc/gshadow r,
+  deny /etc/sudoers rwklm,
+  deny /etc/sudoers.d/** rwklm,
+  deny /etc/ssh/** rwklm,
+  deny /var/** rwklm,
+
+  # No sys_admin capability or execute permission for other binaries is granted.
+  deny capability sys_admin,
+}
