@@ -1,0 +1,170 @@
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        timeout(time: 10, unit: 'MINUTES')
+    }
+
+    environment {
+        DEPLOY_DIR = "${WORKSPACE}/python-app-deploy-${BUILD_NUMBER}"
+        VENV_DIR = "${WORKSPACE}/Ex 9/.venv-ci-${BUILD_NUMBER}"
+        APP_PORT = ''
+        PYTHONDONTWRITEBYTECODE = '1'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    if (!isUnix()) {
+                        error('This Jenkinsfile requires a Linux/Unix agent with sh, Python 3, pip, and venv support.')
+                    }
+                }
+                dir('Ex 9') {
+                    sh '''
+                        set -eu
+                        command -v python3
+                        python3 --version
+                        python3 -m pip --version
+                        if ! python3 -m venv "$VENV_DIR"; then
+                            echo 'Python venv support is required; provision it on the agent before retrying.' >&2
+                            exit 1
+                        fi
+                        "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r requirements.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                dir('Ex 9') {
+                    sh '''
+                        set -eu
+                        "$VENV_DIR/bin/python" -m unittest discover -s . -v
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                dir('Ex 9') {
+                    sh '''
+                        set -eu
+                        mkdir -p "$DEPLOY_DIR"
+                        cp app.py requirements.txt "$DEPLOY_DIR/"
+                        test -s "$DEPLOY_DIR/app.py"
+                        test -s "$DEPLOY_DIR/requirements.txt"
+                        echo "Mock deployment prepared at $DEPLOY_DIR"
+                    '''
+                }
+            }
+        }
+
+        stage('Run Application') {
+            steps {
+                script {
+                    env.APP_PORT = sh(
+                        script: 'python3 -c \'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()\'',
+                        returnStdout: true
+                    ).trim()
+                }
+                sh '''
+                    set -eu
+                    test -s "$DEPLOY_DIR/app.py"
+                    PORT="$APP_PORT" nohup "$VENV_DIR/bin/python" \
+                        "$DEPLOY_DIR/app.py" \
+                        >"$DEPLOY_DIR/app.log" 2>&1 </dev/null &
+                    echo $! > "$DEPLOY_DIR/app.pid"
+                    sleep 1
+                    app_pid=$(cat "$DEPLOY_DIR/app.pid")
+                    if ! kill -0 "$app_pid" 2>/dev/null; then
+                        cat "$DEPLOY_DIR/app.log"
+                        echo 'Deployed Flask process exited during startup.' >&2
+                        exit 1
+                    fi
+                    echo "Deployed Flask process started on 127.0.0.1:$APP_PORT (pid $app_pid)."
+                '''
+            }
+        }
+
+        stage('Test Application') {
+            steps {
+                sh '''
+                    set -eu
+                    healthy=0
+                    for attempt in $(seq 1 30); do
+                        if "$VENV_DIR/bin/python" -c \
+                            'import sys, urllib.request; response=urllib.request.urlopen(sys.argv[1], timeout=2); body=response.read().decode(); assert response.status == 200; assert body == "Hello, Jenkins Multi-Stage Pipeline!"' \
+                            "http://127.0.0.1:$APP_PORT/" 2>/dev/null; then
+                            healthy=1
+                            break
+                        fi
+                        sleep 1
+                    done
+                    if [ "$healthy" -ne 1 ]; then
+                        cat "$DEPLOY_DIR/app.log"
+                        echo 'Deployed application did not return the expected response.' >&2
+                        exit 1
+                    fi
+                    echo 'HTTP 200 and expected Flask response verified.'
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Build, tests, mock deployment, and deployed-app check succeeded.'
+        }
+        failure {
+            echo 'Pipeline failed; inspect the first failed stage and its console output.'
+        }
+        always {
+            script {
+                if (isUnix()) {
+                    sh '''
+                        set +e
+                        if [ -n "${DEPLOY_DIR:-}" ] && [ -f "$DEPLOY_DIR/app.pid" ]; then
+                            app_pid=$(cat "$DEPLOY_DIR/app.pid")
+                            case "$app_pid" in
+                                ''|*[!0-9]*) echo 'Invalid app PID file; skipping process stop.' >&2 ;;
+                                *)
+                                    app_command=$(ps -p "$app_pid" -o args= 2>/dev/null)
+                                    case "$app_command" in
+                                        *"$DEPLOY_DIR/app.py"*)
+                                            kill "$app_pid" 2>/dev/null
+                                            for attempt in $(seq 1 10); do
+                                                kill -0 "$app_pid" 2>/dev/null || break
+                                                sleep 1
+                                            done
+                                            kill -9 "$app_pid" 2>/dev/null
+                                            ;;
+                                        *) echo 'Tracked PID is not this deployment; skipping process stop.' ;;
+                                    esac
+                                    ;;
+                            esac
+                        fi
+                        if [ -n "${DEPLOY_DIR:-}" ]; then
+                            rm -rf -- "$DEPLOY_DIR"
+                        fi
+                        if [ -n "${VENV_DIR:-}" ]; then
+                            rm -rf -- "$VENV_DIR"
+                        fi
+                    '''
+                } else {
+                    echo 'Unix cleanup skipped because this agent is not supported by this pipeline.'
+                }
+            }
+        }
+    }
+}
